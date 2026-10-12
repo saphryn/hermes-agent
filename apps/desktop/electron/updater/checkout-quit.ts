@@ -14,6 +14,7 @@ export function createCheckoutQuitLifecycle<Event extends QuitEvent>(deps: Check
   let pending: Promise<void> | null = null
   let quitting = false
   let waitingForPreflight = false
+  let quitGeneration = 0
 
   const cancelled = (): Error => new Error('Update cancelled because Desktop is quitting.')
 
@@ -25,12 +26,14 @@ export function createCheckoutQuitLifecycle<Event extends QuitEvent>(deps: Check
 
       // Include config/launcher resolution, not just the snapshot child. Keep
       // ownership until the caller's continuation has been admitted or refused.
+      const generation = quitGeneration
       pending = Promise.resolve().then(() => deps.preflightStateDb(home, log))
 
       try {
         await pending
 
-        if (quitting) {
+        // A later Keep Running releases future work, not this cancelled update.
+        if (generation !== quitGeneration) {
           throw cancelled()
         }
       } finally {
@@ -38,22 +41,37 @@ export function createCheckoutQuitLifecycle<Event extends QuitEvent>(deps: Check
       }
     },
     beforeQuit(event: Event): void {
-      // "Keep Running" must neither cancel the update nor latch teardown.
+      // A newly held prompt revokes any earlier admitted quit. Keep Running
+      // will not re-enter; Quit Anyway makes a new request through this seam.
       if (deps.heldQuitForActiveWork(event)) {
+        quitting = false
+        waitingForPreflight = false
+
         return
       }
 
-      quitting = true
+      if (!quitting) {
+        quitting = true
+        quitGeneration += 1
+      }
 
       if (pending) {
         event.preventDefault()
 
         if (!waitingForPreflight) {
           waitingForPreflight = true
+          const generation = quitGeneration
+
+          const resumeQuit = () => {
+            if (quitting && generation === quitGeneration) {
+              deps.quit()
+            }
+          }
+
           // Don't kill the snapshot or allow a stale updater handoff. Even a
           // failed snapshot may release an explicitly requested ordinary quit;
           // the update itself still rejects before any update teardown/spawn.
-          void pending.then(deps.quit, deps.quit)
+          void pending.then(resumeQuit, resumeQuit)
         }
 
         return

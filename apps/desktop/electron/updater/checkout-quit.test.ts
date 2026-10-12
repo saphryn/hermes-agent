@@ -6,6 +6,7 @@ import path from 'node:path'
 import { expect, it, vi } from 'vitest'
 
 import { createBackendShutdownCoordinator } from '../backend-ownership'
+import { quitPromptFor } from '../quit-guard'
 import { backendQuitNeedsWait, createQuitTeardownCoordinator } from '../quit-teardown'
 import * as updaterProcess from '../updater-process'
 
@@ -183,3 +184,79 @@ it('Keep Running does not cancel preflight or latch the next ordinary quit', asy
   lifecycle.beforeQuit(event)
   expect(teardown).toHaveBeenCalledExactlyOnceWith(event)
 })
+
+it.each(['before', 'after'] as const)(
+  'Keep Running %s snapshot settlement releases future updates without reviving cancelled work',
+  async timing => {
+    const snapshot = deferred()
+    const laterSnapshot = deferred()
+    const app = new EventEmitter()
+    let activeWork = false
+    const teardown = vi.fn()
+    const promptShown = vi.fn()
+
+    const backup = vi
+      .fn<() => Promise<void>>()
+      .mockImplementationOnce(() => snapshot.promise)
+      .mockResolvedValueOnce(undefined)
+      .mockImplementationOnce(() => laterSnapshot.promise)
+
+    const quit = vi.fn(() => app.emit('before-quit', { preventDefault: vi.fn() }))
+
+    const lifecycle = createCheckoutQuitLifecycle({
+      preflightStateDb: backup,
+      heldQuitForActiveWork: event => {
+        const prompt = quitPromptFor({ count: activeWork ? 1 : 0, titles: [] }, false)
+
+        if (!prompt) {
+          return false
+        }
+
+        event.preventDefault()
+        promptShown(prompt.buttons)
+
+        // The native guard holds this quit; Keep Running does not re-enter
+        // app.quit(). Only Quit Anyway would make another admitted request.
+        return true
+      },
+      teardown,
+      quit
+    })
+
+    app.on('before-quit', lifecycle.beforeQuit)
+
+    const interrupted = lifecycle.preflightStateDb('home', vi.fn())
+    const interruptedResult = expect(interrupted).rejects.toThrow(/cancelled.*quit/i)
+    await Promise.resolve()
+    quit() // Initially idle: admitted, waiting on the snapshot.
+    activeWork = true
+
+    if (timing === 'before') {
+      quit() // Active work now holds a repeated quit before snapshot settlement.
+    }
+
+    snapshot.resolve()
+    await interruptedResult
+    await new Promise(resolve => setImmediate(resolve))
+    expect(promptShown).toHaveBeenCalledExactlyOnceWith(['Keep Running', 'Quit Anyway'])
+    expect(quit).toHaveBeenCalledTimes(2) // No stale third quit after Keep Running.
+    expect(teardown).not.toHaveBeenCalled()
+    await expect(lifecycle.preflightStateDb('home', vi.fn())).resolves.toBeUndefined()
+    expect(backup).toHaveBeenCalledTimes(2)
+
+    // A new admitted quit must still wait and re-enter once; an old wait latch
+    // must not strand it, nor may cancelling the earlier quit revive its update.
+    activeWork = false
+    const later = lifecycle.preflightStateDb('home', vi.fn())
+    const laterResult = expect(later).rejects.toThrow(/cancelled.*quit/i)
+    await Promise.resolve()
+    quit()
+    expect(teardown).not.toHaveBeenCalled()
+    laterSnapshot.resolve()
+    await laterResult
+    await new Promise(resolve => setImmediate(resolve))
+    expect(backup).toHaveBeenCalledTimes(3)
+    expect(teardown).toHaveBeenCalledOnce()
+    expect(quit).toHaveBeenCalledTimes(4)
+  }
+)
