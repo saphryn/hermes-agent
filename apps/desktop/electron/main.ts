@@ -645,6 +645,7 @@ import { inspectRunningChannelApp } from './updater/channel-native'
 import { ChannelStrategy } from './updater/channel-strategy'
 import { verifyPreparedChannelInstaller } from './updater/channel-windows-host'
 import { type CheckoutStrategy, createCheckoutStrategy } from './updater/checkout'
+import { createCheckoutQuitLifecycle } from './updater/checkout-quit'
 import { readSourceUpdate, sourceChannelName, type SourceUpdate } from './updater/checkout-source'
 import { ExternalStrategy } from './updater/external'
 import { readUpdatesFeedBaseFromConfig, resolveFeedBaseUrl } from './updater/feed-config'
@@ -3927,47 +3928,7 @@ function resolveCheckoutUpdateStrategy(): CheckoutStrategy {
     startHermes,
     stopBackendsForUpdate,
     repairMacUpdaterHelper: updater => repairMacUpdaterHelper(updater, { isMac: IS_MAC, log: rememberLog }),
-    preflightStateDb: async (home: string, log: (message: string) => void): Promise<void> => {
-      const root: string = resolveUpdateRoot()
-
-      // `updates.pre_update_backup: off` is the CLI's opt-out for the whole
-      // pre-update backup family; the Desktop's emergency snapshot honours it
-      // too (4de06d1dbf7b). An unreadable answer keeps the snapshot.
-      if (
-        !(await readPreUpdateBackupEnabled(
-          resolveHermesBackend(['config', 'get', 'updates.pre_update_backup', '--json']),
-          home
-        ))
-      ) {
-        log('[updates] emergency state.db backup disabled by updates.pre_update_backup')
-
-        return
-      }
-
-      // PM-managed checkouts carry no venv of their own: the installation
-      // launcher owns interpreter and generation selection there — same
-      // contract as readSourceUpdate and the hand-off script.
-      const managed: boolean = directoryExists(path.join(root, 'pm'))
-
-      const launcher: string | null = managed ? resolveInstallationLauncher(root, IS_WINDOWS, HERMES_HOME) : null
-
-      if (managed && !launcher) {
-        const message =
-          `state.db pre-flight failed: the installation launcher under ${root} is missing. ` +
-          'Update cancelled before backend shutdown. Repair this installation before retrying.'
-
-        log(`[updates] ${message}`)
-        throw new Error(message)
-      }
-
-      await preflightStateDb({
-        python: managed ? null : await findPythonForRoot(root),
-        launcher,
-        script: path.join(root, 'hermes_cli', 'backup_sqlite.py'),
-        home,
-        log
-      })
-    },
+    preflightStateDb: (home, log) => checkoutQuitLifecycle.preflightStateDb(home, log),
     runningAppBundle,
     markQuittingForHandoff: () => {
       isQuittingForHandoff = true
@@ -3975,6 +3936,64 @@ function resolveCheckoutUpdateStrategy(): CheckoutStrategy {
     quit: () => app.quit()
   })
 }
+
+const checkoutQuitLifecycle = createCheckoutQuitLifecycle<Electron.Event>({
+  preflightStateDb: async (home: string, log: (message: string) => void): Promise<void> => {
+    const root: string = resolveUpdateRoot()
+
+    // `updates.pre_update_backup: off` is the CLI's opt-out for the whole
+    // pre-update backup family; the Desktop's emergency snapshot honours it
+    // too (4de06d1dbf7b). An unreadable answer keeps the snapshot.
+    if (
+      !(await readPreUpdateBackupEnabled(
+        resolveHermesBackend(['config', 'get', 'updates.pre_update_backup', '--json']),
+        home
+      ))
+    ) {
+      log('[updates] emergency state.db backup disabled by updates.pre_update_backup')
+
+      return
+    }
+
+    // PM-managed checkouts carry no venv of their own: the installation
+    // launcher owns interpreter and generation selection there — same
+    // contract as readSourceUpdate and the hand-off script.
+    const managed: boolean = directoryExists(path.join(root, 'pm'))
+
+    const launcher: string | null = managed ? resolveInstallationLauncher(root, IS_WINDOWS, HERMES_HOME) : null
+
+    if (managed && !launcher) {
+      const message =
+        `state.db pre-flight failed: the installation launcher under ${root} is missing. ` +
+        'Update cancelled before backend shutdown. Repair this installation before retrying.'
+
+      log(`[updates] ${message}`)
+      throw new Error(message)
+    }
+
+    await preflightStateDb({
+      python: managed ? null : await findPythonForRoot(root),
+      launcher,
+      script: path.join(root, 'hermes_cli', 'backup_sqlite.py'),
+      home,
+      log
+    })
+  },
+  heldQuitForActiveWork: event => {
+    // "Keep Running" precedes preflight cancellation and all teardown; don't
+    // leak the overlay-suppression latch into the next close (#130810).
+    if (!heldQuitForActiveWork(event)) {
+      return false
+    }
+
+    appQuitting = false
+    quitInProgress = false
+
+    return true
+  },
+  teardown: teardownForQuit,
+  quit: () => app.quit()
+})
 
 /**
  * The App Installer feed base URL for a bundled MSIX install: config.yaml's
@@ -19623,17 +19642,9 @@ function quitIfNoSurfaceLeft() {
   }
 }
 
-app.on('before-quit', event => {
-  // Runs ahead of every teardown below, so "Keep Running" leaves the app
-  // exactly as it was: a held quit is not a quit in progress, and the
-  // overlay-suppression latch must not leak into the next close (#130810).
-  if (heldQuitForActiveWork(event)) {
-    appQuitting = false
-    quitInProgress = false
+app.on('before-quit', checkoutQuitLifecycle.beforeQuit)
 
-    return
-  }
-
+function teardownForQuit(event: Electron.Event): void {
   // Quit is really proceeding: latch both before ANY teardown below closes
   // the pet overlay — its 'closed' handler must not echo pop-in during quit,
   // or the persisted popped-out state is wiped and the overlay never restores
@@ -19764,7 +19775,7 @@ app.on('before-quit', event => {
   terminalIpc.disposeAllTerminalSessions()
 
   void backendShutdown.run()
-})
+}
 
 app.on('window-all-closed', () => {
   // macOS convention: keep the process alive in the Dock when the user closes
